@@ -1,0 +1,451 @@
+classdef test < matlab.apps.AppBase
+
+    % Properties that correspond to app components
+    properties (Access = public)
+        UIFigure                        matlab.ui.Figure
+        SetCircleButton                 matlab.ui.control.Button
+        LongitudedegreesEditField       matlab.ui.control.NumericEditField
+        LongitudedegreesEditFieldLabel  matlab.ui.control.Label
+        LatitudedegreesEditField        matlab.ui.control.NumericEditField
+        LatitudedegreesEditFieldLabel   matlab.ui.control.Label
+        CircleRadiusmEditField          matlab.ui.control.NumericEditField
+        CircleRadiusmEditFieldLabel     matlab.ui.control.Label
+    end
+
+    
+    properties (Access = private)
+        R        double = 0.20   % sphere radius (m) – same as Part 1
+        d_tcp    double = 0.65   % TCP distance from base (m)
+        maxReach double = 0.70  % approximate robot reach (m)
+    end
+    
+    
+methods (Access = private)
+
+    % ---- Helper: latitude/longitude -> unit direction vector ----
+    function v = latLonToDir(app, latDeg, lonDeg)
+        lat = deg2rad(latDeg);
+        lon = deg2rad(lonDeg);
+        v = [cos(lat)*cos(lon);   % x
+             cos(lat)*sin(lon);   % y
+             sin(lat)];           % z
+        v = v / max(1e-12, norm(v));
+    end
+        % ---- Helper: multi-start ikcon (from Part 1) ----
+    function q = multistart_ikcon(app, BOT, Td, tries)
+        best    = [];
+        besterr = inf;
+        for s = 1:tries
+            qseed = app.rand_in_limits(BOT.qlim);
+            try
+                [qk, err] = BOT.ikcon(Td, qseed);
+            catch
+                qk  = [];
+                err = inf;
+            end
+            if ~isempty(qk) && all(isfinite(qk)) && err < besterr
+                best    = qk(:).';
+                besterr = err;
+            end
+        end
+        if isempty(best)
+            error('ikcon failed to find a feasible first pose');
+        end
+        q = best;
+    end
+
+    % ---- Helper: clamp to joint limits ----
+    function qrow = clamp(app, qrow, qlim)
+        qrow = min(max(qrow, qlim(:,1).'), qlim(:,2).');
+    end
+
+    % ---- Helper: random config in limits ----
+    function q = rand_in_limits(app, qlim)
+        lo = qlim(:,1).'; 
+        hi = qlim(:,2).'; 
+        q  = lo + rand(1,6).*(hi-lo);
+    end
+
+    % ---- Helper: DLS tilt-only servo with nullspace/backtracking ----
+    function qnext = lock_to_point(app, BOT, qstart, p_target, z_inward, q_ref, ...
+            pos_tol, tilt_tol, lambda, step0, step_min, ...
+            qdot_max, k_null, itmax)
+
+        w_pos  = 1.0;
+        w_tilt = 2.0;
+
+        qk = qstart(:).';
+
+        unit   = @(v) v / max(1e-12, norm(v));
+        make_uv = @(z) ( ...
+            (abs(dot(z,[1;0;0])) < 0.9) .* ...
+                [unit(cross(z,[1;0;0])), ...
+                 unit(cross(z, unit(cross(z,[1;0;0]))))] + ...
+            (abs(dot(z,[1;0;0])) >= 0.9) .* ...
+                [unit(cross(z,[0;1;0])), ...
+                 unit(cross(z, unit(cross(z,[0;1;0]))))] );
+
+        [pos_e, tilt_e] = app.cur_err(BOT, qk, p_target, z_inward);
+        step = step0;
+
+        for t = 1:itmax %#ok<NASGU>
+            Tnow = BOT.fkine(qk).T;
+            pnow = Tnow(1:3,4);
+            znow = Tnow(1:3,3);
+
+            e_pos  = p_target - pnow;
+            e_axis = cross(znow, z_inward);
+
+            UV    = make_uv(znow);
+            e_tilt = UV.' * e_axis;
+
+            e = [w_pos*e_pos; w_tilt*e_tilt];
+
+            J     = BOT.jacob0(qk);
+            Jtilt = UV.' * J(4:6,:);
+            Jact  = [w_pos*J(1:3,:); w_tilt*Jtilt];
+
+            JJt   = Jact*Jact.';
+            Jpinv = Jact.' * ((JJt + (lambda^2)*eye(5)) \ eye(5));
+
+            qdot = Jpinv * e;
+
+            % nullspace smoothing
+            Nmat = eye(6) - Jpinv*Jact;
+            qdot = qdot + k_null * (Nmat * (q_ref(:) - qk(:)));
+
+            % speed limit + backtracking
+            qdot = qdot * min(1, qdot_max / max(1e-12, norm(qdot)));
+
+            improved = false;
+            for tries = 1:6
+                qtrial = app.clamp(qk + step*qdot.', BOT.qlim);
+                [pos_e_new, tilt_e_new] = app.cur_err(BOT, qtrial, p_target, z_inward);
+                if (pos_e_new <= pos_e && tilt_e_new <= tilt_e) || step <= step_min
+                    qk     = qtrial;
+                    pos_e  = pos_e_new;
+                    tilt_e = tilt_e_new;
+                    improved = true;
+                    break
+                else
+                    step = 0.5*step;
+                end
+            end
+
+            if ~improved
+                qk = qtrial; %#ok<NASGU>
+            end
+
+            if pos_e <= pos_tol && tilt_e <= tilt_tol
+                break;
+            end
+        end
+
+        qnext = qk;
+    end
+
+    % ---- Helper: current position & tilt error ----
+    function [pos_e, tilt_e] = cur_err(app, BOT, q, p_target, z_inward)
+        T    = BOT.fkine(q).T;
+        pnow = T(1:3,4);
+        znow = T(1:3,3);
+        pos_e  = norm(p_target - pnow);
+        tilt_e = acos(max(-1,min(1, dot(znow, z_inward)))) * 180/pi;
+    end
+
+    % ---- Helper: build small circle on sphere (same math as Part 1) ----
+    function [center, p, zdes, xtan, Tdes] = build_targets(app,R,alpha,d,aim_dir,N)
+
+        aim_dir = aim_dir / norm(aim_dir);
+
+        under = d^2 - (R*sin(alpha))^2;
+        if under <= 0
+            % clamp alpha slightly if numerical issues
+            alpha = asin(0.95*d/R);
+            under = d^2 - (R*sin(alpha))^2;
+        end
+
+        c = R*cos(alpha) + sqrt(under);
+        center = (c*aim_dir).';
+
+        % local basis on sphere for circle generation
+        n = -center(:)/norm(center);
+        w = [0;0;1];
+        if abs(dot(n,w)) > 0.97
+            w = [0;1;0];
+        end
+        e1 = cross(n,w); e1 = e1/norm(e1);
+        e2 = cross(n,e1);
+
+        theta = linspace(0,2*pi,N);
+        p    = zeros(3,N);
+        zdes = zeros(3,N);
+        xtan = zeros(3,N);
+
+        for k = 1:N
+            th = theta(k);
+            p(:,k) = center' + R*( cos(alpha)*n + ...
+                      sin(alpha)*( e1*cos(th) + e2*sin(th) ) );
+            % inward normal at p_k
+            zdes(:,k) = - (p(:,k)-center')/R;
+
+            dpdth = R*sin(alpha)*(-e1*sin(th) + e2*cos(th));
+            xtan(:,k) = dpdth / max(1e-9, norm(dpdth));
+        end
+
+        % Frames (for completeness; not used in reachability check)
+        Tdes = repmat(eye(4),1,1,N);
+        for k = 1:N
+            yk = cross(zdes(:,k), xtan(:,k)); yk = yk/norm(yk);
+            xk = cross(yk, zdes(:,k));
+            Tdes(:,:,k) = [xk, yk, zdes(:,k), p(:,k); 0 0 0 1];
+        end
+    end
+end
+
+
+    % Callbacks that handle component events
+    methods (Access = private)
+
+        % Button pushed function: SetCircleButton
+        function SetCircleButtonPushed(app, event)
+            % 1) Read user inputs from the GUI
+            latDeg = app.LatitudedegreesEditField.Value;    % degrees
+            lonDeg = app.LongitudedegreesEditField.Value;   % degrees
+            rcirc  = app.CircleRadiusmEditField.Value;      % meters
+        
+            % 2) Basic validation
+            if latDeg < -90 || latDeg > 90
+                uialert(app.UIFigure, ...
+                    'Latitude must be between -90 and +90 degrees.', ...
+                    'Invalid Latitude');
+                return;
+            end
+        
+            if lonDeg < -180 || lonDeg > 180
+                uialert(app.UIFigure, ...
+                    'Longitude must be between -180 and +180 degrees.', ...
+                    'Invalid Longitude');
+                return;
+            end
+        
+            if rcirc <= 0 || rcirc >= app.R
+                uialert(app.UIFigure, ...
+                    sprintf('Radius must be > 0 and < %.3f m (sphere radius).', app.R), ...
+                    'Invalid Radius');
+                return;
+            end
+        
+            % 3) Convert inputs to geometry parameters
+            alpha   = asin(rcirc / app.R);             % circle half-angle on sphere
+            aim_dir = app.latLonToDir(latDeg, lonDeg); % center direction unit vector
+        
+            % 4) Build the circle on the sphere
+            N = 360;                                   % number of waypoints
+            [center, p, zdes, ~, Tdes] = app.build_targets(app.R, alpha, app.d_tcp, aim_dir, N);
+
+        
+            % 5) Reachability check (simple: distance from base)
+            d = vecnorm(p, 2, 1);   % distance from origin to each circle point
+        
+            if any(d > app.maxReach)
+                uialert(app.UIFigure, ...
+                    'This circle is outside the robot''s reachable workspace. Choose different inputs.', ...
+                    'Unreachable Circle');
+            else
+                % ---------- Circle reachable: build robot and animate ----------
+            
+                % --- Robot model (same as your Part 1 script) ---
+                mm = 1e-3;
+                L(1) = Link('d', 335*mm, 'a', 75*mm, 'alpha', -pi/2, 'offset', 0, 'standard');
+                L(2) = Link('d', 0*mm,   'a', 270*mm,'alpha', 0,     'offset', 0, 'standard');
+                L(3) = Link('d', 0*mm,   'a', 90*mm, 'alpha', +pi/2,'offset', 0, 'standard');
+                L(4) = Link('d', -295*mm,'a', 0*mm,  'alpha', -pi/2,'offset', 0, 'standard');
+                L(5) = Link('d', 0*mm,   'a', 0*mm,  'alpha', +pi/2,'offset', 0, 'standard');
+                L(6) = Link('d', -80*mm, 'a', 0*mm,  'alpha', pi,   'offset', 0, 'standard');
+            
+                BOT = SerialLink(L,'name','KUKA_KR5_R650');
+                BOT.base = transl(0,0,0);
+                BOT.tool = transl(0,0,0);
+                BOT.qlim = deg2rad([ ...
+                    -170 170;
+                    -190 45;
+                    -119 165;
+                    -190 190;
+                    -120 120;
+                    -358 358]);
+            
+                % --- Resolved-rate servo settings (same as Part 1) ---
+                COARSE.POS_TOL   = 2.0e-4;
+                COARSE.TILT_TOL  = 0.15;
+                COARSE.LAMBDA    = 0.08;
+                COARSE.STEP0     = 0.16;
+                COARSE.STEP_MIN  = 0.04;
+                COARSE.QDOT_MAX  = 0.35;
+                COARSE.K_NULL    = 0.06;
+                COARSE.MAX_INNER = 80;
+                plot_every       = 3;
+            
+                REF.POS_TOL   = 5.0e-5;
+                REF.TILT_TOL  = 0.06;
+                REF.LAMBDA    = 0.08;
+                REF.STEP0     = 0.12;
+                REF.STEP_MIN  = 0.02;
+                REF.QDOT_MAX  = 0.25;
+                REF.K_NULL    = 0.06;
+                REF.MAX_INNER = 300;
+            
+                % --- Visualization: sphere and target circle ---
+                figure('Color',[0.1 0.1 0.1]); hold on; axis equal; grid on
+                [xs,ys,zs] = sphere(64);
+                surf(app.R*xs + center(1), app.R*ys + center(2), app.R*zs + center(3), ...
+                    'FaceAlpha',0.22,'EdgeColor','none','FaceColor',[0 0.6 1]);
+                plot3(p(1,:),p(2,:),p(3,:),'r','LineWidth',2);
+                xlabel('X'); ylabel('Y'); zlabel('Z');
+                title('KR5: TCP tip locked to circle on sphere');
+            
+                BOT.plot(zeros(1,6), ...
+                    'workspace',[-0.9 1.2 -0.9 1.2 -0.1 1.3], ...
+                    'scale',0.7,'noname');
+            
+                legend({'Sphere','Target circle','Robot'}, ...
+                    'TextColor','w','Location','northoutside');
+            
+                % --- Good first pose using ikcon (same idea as Part 1) ---
+                Td0 = SE3(Tdes(:,:,1));      % desired pose for first point
+                q0  = app.multistart_ikcon(BOT, Td0, 50);
+                q0  = app.clamp(q0, BOT.qlim);
+            
+                % tighten first waypoint with coarse tolerances
+                q0 = app.lock_to_point(BOT, q0, p(:,1), zdes(:,1), q0, ...
+                    COARSE.POS_TOL, COARSE.TILT_TOL, COARSE.LAMBDA, ...
+                    COARSE.STEP0, COARSE.STEP_MIN, ...
+                    COARSE.QDOT_MAX, COARSE.K_NULL, COARSE.MAX_INNER);
+            
+                % TCP marker
+                Tk  = BOT.fkine(q0).T;
+                pt  = Tk(1:3,4);
+                hTip = plot3(pt(1),pt(2),pt(3),'yo','MarkerSize',6,'MarkerFaceColor','y');
+            
+                % --- PASS A: coarse trajectory ---
+                q_coarse = zeros(N,6);
+                q_coarse(1,:) = q0;
+            
+                for k = 2:N
+                    qref = q_coarse(k-1,:);
+                    qk = app.lock_to_point(BOT, qref, p(:,k), zdes(:,k), qref, ...
+                        COARSE.POS_TOL, COARSE.TILT_TOL, COARSE.LAMBDA, ...
+                        COARSE.STEP0, COARSE.STEP_MIN, ...
+                        COARSE.QDOT_MAX, COARSE.K_NULL, COARSE.MAX_INNER);
+                    q_coarse(k,:) = qk;
+            
+                    % live preview
+                    if mod(k,plot_every)==0 || k==N
+                        Tk = BOT.fkine(qk).T; pt = Tk(1:3,4);
+                        set(hTip,'XData',pt(1),'YData',pt(2),'ZData',pt(3));
+                        BOT.plot(qk,'workspace',[-0.9 1.2 -0.9 1.2 -0.1 1.3], ...
+                            'trail',{'r',2},'scale',0.7,'noname');
+                        drawnow;
+                    end
+                end
+            
+                % --- PASS B: refine path ---
+                q_ref = q_coarse;
+                for k = 1:N
+                    qseed = q_ref(k,:);
+                    q_ref(k,:) = app.lock_to_point(BOT, qseed, p(:,k), zdes(:,k), qseed, ...
+                        REF.POS_TOL, REF.TILT_TOL, REF.LAMBDA, ...
+                        REF.STEP0, REF.STEP_MIN, ...
+                        REF.QDOT_MAX, REF.K_NULL, REF.MAX_INNER);
+                end
+            
+                % --- Final animation of refined path ---
+                for k = 1:N
+                    Tk = BOT.fkine(q_ref(k,:)).T; pt = Tk(1:3,4);
+                    set(hTip,'XData',pt(1),'YData',pt(2),'ZData',pt(3));
+                    BOT.plot(q_ref(k,:),'workspace',[-0.9 1.2 -0.9 1.2 -0.1 1.3], ...
+                        'trail',{'r',2},'scale',0.7,'noname');
+                    drawnow;
+                end
+            end
+
+        end
+    end
+
+    % Component initialization
+    methods (Access = private)
+
+        % Create UIFigure and components
+        function createComponents(app)
+
+            % Create UIFigure and hide until all components are created
+            app.UIFigure = uifigure('Visible', 'off');
+            app.UIFigure.Position = [100 100 640 480];
+            app.UIFigure.Name = 'MATLAB App';
+
+            % Create CircleRadiusmEditFieldLabel
+            app.CircleRadiusmEditFieldLabel = uilabel(app.UIFigure);
+            app.CircleRadiusmEditFieldLabel.HorizontalAlignment = 'right';
+            app.CircleRadiusmEditFieldLabel.Position = [208 201 96 22];
+            app.CircleRadiusmEditFieldLabel.Text = 'Circle Radius (m)';
+
+            % Create CircleRadiusmEditField
+            app.CircleRadiusmEditField = uieditfield(app.UIFigure, 'numeric');
+            app.CircleRadiusmEditField.Position = [319 201 115 22];
+
+            % Create LatitudedegreesEditFieldLabel
+            app.LatitudedegreesEditFieldLabel = uilabel(app.UIFigure);
+            app.LatitudedegreesEditFieldLabel.HorizontalAlignment = 'right';
+            app.LatitudedegreesEditFieldLabel.Position = [208 243 101 22];
+            app.LatitudedegreesEditFieldLabel.Text = 'Latitude (degrees)';
+
+            % Create LatitudedegreesEditField
+            app.LatitudedegreesEditField = uieditfield(app.UIFigure, 'numeric');
+            app.LatitudedegreesEditField.Position = [324 243 110 22];
+
+            % Create LongitudedegreesEditFieldLabel
+            app.LongitudedegreesEditFieldLabel = uilabel(app.UIFigure);
+            app.LongitudedegreesEditFieldLabel.HorizontalAlignment = 'right';
+            app.LongitudedegreesEditFieldLabel.Position = [208 285 111 22];
+            app.LongitudedegreesEditFieldLabel.Text = 'Longitude (degrees)';
+
+            % Create LongitudedegreesEditField
+            app.LongitudedegreesEditField = uieditfield(app.UIFigure, 'numeric');
+            app.LongitudedegreesEditField.Position = [334 285 100 22];
+
+            % Create SetCircleButton
+            app.SetCircleButton = uibutton(app.UIFigure, 'push');
+            app.SetCircleButton.ButtonPushedFcn = createCallbackFcn(app, @SetCircleButtonPushed, true);
+            app.SetCircleButton.Position = [271 360 100 23];
+            app.SetCircleButton.Text = 'Set Circle';
+
+            % Show the figure after all components are created
+            app.UIFigure.Visible = 'on';
+        end
+    end
+
+    % App creation and deletion
+    methods (Access = public)
+
+        % Construct app
+        function app = test
+
+            % Create UIFigure and components
+            createComponents(app)
+
+            % Register the app with App Designer
+            registerApp(app, app.UIFigure)
+
+            if nargout == 0
+                clear app
+            end
+        end
+
+        % Code that executes before app deletion
+        function delete(app)
+
+            % Delete UIFigure when app is deleted
+            delete(app.UIFigure)
+        end
+    end
+end

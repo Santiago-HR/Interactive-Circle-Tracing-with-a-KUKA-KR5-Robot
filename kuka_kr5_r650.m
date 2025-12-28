@@ -5,7 +5,7 @@
 
 clear; clc; close all;
 
-%% ---------------- Robot model (your DH, meters) ------------------------
+%% ---------------- Robot model ------------------------
 mm = 1e-3;
 
 L(1) = Link('d', 335*mm, 'a',  75*mm, 'alpha', -pi/2, 'offset', 0, 'standard');
